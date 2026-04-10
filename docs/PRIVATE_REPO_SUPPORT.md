@@ -40,17 +40,31 @@ Even though credentials are *associated* per-repo, the encrypted values live in 
 - A separate table makes encryption, access control, and audit logging straightforward
 - The daemon resolves credentials at git-operation time via a targeted API call, not by receiving them in the workspace sync payload
 
+### URL Normalization
+
+Repo URLs must be normalized before storing or looking up credentials. Without normalization, `https://github.com/org/repo` and `https://github.com/org/repo.git` resolve to different rows, and a user who adds a repo with one form won't get their credential applied when the daemon uses the other form.
+
+Normalization rules (applied in a `normalizeRepoURL(url string) string` helper):
+1. Lowercase the scheme and host
+2. Strip trailing `.git`
+3. Strip trailing `/`
+4. Strip default ports (`:80` for http, `:443` for https)
+
+This function is called in three places: when writing a credential (PUT endpoint), when reading a credential (GET/DELETE endpoints and the resolve endpoint), and in `repocache/cache.go` before looking up credentials via the resolver.
+
+The `UNIQUE(workspace_id, repo_url)` constraint stores normalized URLs only.
+
 ### Encryption
 
 AES-256-GCM with a server-level key (`MULTICA_CREDENTIAL_KEY` env var). Each credential row uses a unique nonce. HKDF key derivation with the row ID as context provides per-row key isolation.
 
-For self-hosted deployments without `MULTICA_CREDENTIAL_KEY`, credentials are stored as plaintext with a warning logged at startup. This avoids blocking self-hosted adoption on key management infrastructure.
+`MULTICA_CREDENTIAL_KEY` is **required**. The server refuses to start if it is missing or shorter than 32 bytes, returning a clear error: `MULTICA_CREDENTIAL_KEY must be set to a 32+ byte secret to enable credential storage`. There is no plaintext fallback — silent degradation would allow credentials to land in production databases without encryption.
 
 ## Architecture
 
 ### Database Schema
 
-Migration `040_repo_credentials.up.sql`:
+Migration `0XX_repo_credentials.up.sql` (number assigned at merge time — check `server/migrations/` for the next available number):
 
 ```sql
 CREATE TABLE repo_credential (
@@ -94,6 +108,23 @@ Response: {"cred_type": "pat", "value": {"token": "ghp_xxx"}}
 ```
 
 This endpoint is authenticated via the daemon's registration token (already used for task claims in `handler/daemon.go`). Returns 404 if no credential exists for the repo (public repo — no injection needed).
+
+**Daemon-side caching:** The daemon caches resolved credentials in memory with a 5-minute TTL to avoid hammering the server on every `git fetch` during the 30-second sync loop. The cache is keyed by `(workspaceID, normalizedRepoURL)` and is invalidated on daemon restart. PATs and SSH keys don't rotate frequently, so 5 minutes is safe.
+
+```go
+type cachedCred struct {
+    cred      *Credential
+    fetchedAt time.Time
+}
+
+type credCache struct {
+    mu    sync.Mutex
+    items map[string]cachedCred // key: "wsID/normalizedURL"
+    ttl   time.Duration
+}
+```
+
+The `credCache` lives in the daemon's `CredentialResolver` implementation. On every resolve call it checks the cache first; only on a miss (or expired entry) does it call the server.
 
 ### Credential Injection in repocache
 
@@ -185,8 +216,8 @@ Extend the existing `RepositoriesTab` (`packages/views/settings/components/repos
 Implementation:
 - Credential state is managed per-repo within the `RepositoriesTab` component
 - Saving credentials calls `PUT /workspaces/{id}/repos/{url}/credential` separately from the repos save (credentials are not part of the `repos` JSONB update)
-- Credential values are only shown during initial entry — after save, the UI shows a masked placeholder
-- The "Test" button (stretch goal) calls a new daemon endpoint that runs `git ls-remote` with the credential
+- **Validate on save**: before persisting, the server runs `git ls-remote <repo_url>` with the provided credential. If it fails, the endpoint returns a 422 with the git error message. This catches typos and expired tokens immediately rather than silently failing on the next sync.
+- Credential values are only shown during initial entry — after save, the UI shows a masked placeholder and the type label (e.g. "PAT configured")
 
 New API methods in `packages/core/api/client.ts`:
 
@@ -231,15 +262,15 @@ The daemon logger already uses the redact package; adding patterns there covers 
 
 | File | Change |
 |------|--------|
-| `server/migrations/040_repo_credentials.up.sql` | New `repo_credential` table |
-| `server/migrations/040_repo_credentials.down.sql` | Drop table |
+| `server/migrations/0XX_repo_credentials.up.sql` | New `repo_credential` table (number at merge time) |
+| `server/migrations/0XX_repo_credentials.down.sql` | Drop table |
 | `server/pkg/db/queries/repo_credential.sql` | sqlc queries: upsert, get, delete, resolve |
 | `server/internal/handler/repo_credential.go` | HTTP handlers for credential CRUD |
 | `server/internal/handler/daemon.go` | Add `/internal/repo-credentials/resolve` endpoint |
 | `server/internal/service/credential.go` | Encryption/decryption logic |
 | `server/internal/daemon/repocache/cache.go` | Add `CredentialResolver` interface, inject into `Sync`/`CreateWorktree`/`gitCloneBare`/`runGitFetch` |
 | `server/internal/daemon/repocache/credential.go` | `withPATCredential`, `withSSHCredential` helpers |
-| `server/internal/daemon/daemon.go` | Implement `CredentialResolver` via HTTP client, pass to `Cache` |
+| `server/internal/daemon/daemon.go` | Implement `CredentialResolver` via HTTP client with in-memory TTL cache, pass to `Cache` |
 | `server/cmd/multica/cmd_repo.go` | Add `credential` subcommands |
 | `server/pkg/redact/redact.go` | Add token patterns |
 | `packages/core/api/client.ts` | Add credential API methods |
@@ -248,7 +279,7 @@ The daemon logger already uses the redact package; adding patterns there covers 
 
 ## Security Considerations
 
-1. **Encryption at rest** — AES-256-GCM with per-row key derivation. Self-hosted fallback to plaintext with startup warning.
+1. **Encryption at rest** — AES-256-GCM with per-row key derivation. `MULTICA_CREDENTIAL_KEY` is required; server refuses to start without it.
 2. **No plaintext in transit (within the system)** — Credentials flow from DB → server → daemon over the internal API. In production, this should be TLS. For local dev, it's localhost-only.
 3. **No plaintext in logs** — Redaction patterns in `pkg/redact`. Temp files for askpass/SSH keys use restrictive permissions.
 4. **No agent exposure** — Credentials are injected into daemon-controlled git processes only. Agent processes never receive credential env vars or temp files.
@@ -259,14 +290,15 @@ The daemon logger already uses the redact package; adding patterns there covers 
 
 Each step is independently shippable and testable:
 
-1. **Database migration + encryption service** (`repo_credential` table + `service/credential.go`) — Run `make sqlc` after adding queries.
-2. **Server API endpoints** (CRUD + resolve) — Test with `curl` against a running server.
-3. **Credential injection in repocache** (`CredentialResolver` interface + `withPATCredential`/`withSSHCredential`) — Unit test with a mock resolver. Integration test with a local git server.
-4. **Daemon resolver implementation** — Wire the HTTP client to the server's resolve endpoint. End-to-end test: configure a credential, add a private repo, verify the daemon clones it.
-5. **Frontend UI** — Extend `RepositoriesTab` with per-repo credential fields.
-6. **CLI commands** — `multica repo credential set/get/delete`.
-7. **Redaction patterns** — Extend `pkg/redact`.
-8. **GitHub App support** (future) — Add `github_app` cred type that generates ephemeral installation tokens. Deferred because PATs cover the MVP use case.
+1. **URL normalization helper** — Implement and unit-test `normalizeRepoURL()`. Used everywhere else.
+2. **Database migration + encryption service** (`repo_credential` table + `service/credential.go`) — `MULTICA_CREDENTIAL_KEY` required; add server startup check. Run `make sqlc` after adding queries.
+3. **Server API endpoints** (CRUD + resolve) — Normalize URLs on write/read. Include `git ls-remote` validate-on-save in the PUT handler. Test with `curl`.
+4. **Credential injection in repocache** (`CredentialResolver` interface + `withPATCredential`/`withSSHCredential`) — Unit test with a mock resolver. Integration test with a local git server.
+5. **Daemon resolver implementation** — Wire the HTTP client with in-memory TTL cache (5 min) to the server's resolve endpoint. End-to-end test: configure a credential, add a private repo, verify the daemon clones it.
+6. **Frontend UI** — Extend `RepositoriesTab` with per-repo credential fields. Show validation error from the server if `git ls-remote` fails.
+7. **CLI commands** — `multica repo credential set/get/delete`.
+8. **Redaction patterns** — Extend `pkg/redact`.
+9. **GitHub App support** (future) — Add `github_app` cred type that generates ephemeral installation tokens. Deferred because PATs cover the MVP use case.
 
 ## Open Questions
 
